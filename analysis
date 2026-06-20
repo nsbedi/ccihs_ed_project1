@@ -1,1 +1,1563 @@
+---
+title: Climate Change Impacts on Healthcare Systems (CCIHS) ED Project 1 NSB
+author: 'Dresser Lab: Neil Singh Bedi'
+---
+
+---
+title: "Climate Change Impacts on Healthcare Systems (CCIHS) ED Project 1 NSB"
+author: 'Dresser Lab: Neil Singh Bedi'
+output:
+  html_document: default
+  pdf_document: default
+---
+This analysis was conducted as a part of the work of the Dresser Lab at BIDMC ED, Boston, MA. 
+
+PIs: Caleb J. Dresser MD MPH, Gregory Wellenius ScD. 
+
+The objective of the CCIHS (Climate Change Impacts on Health(care) Systems) is to determine if there is a relationship between certain weather variables and operational outcomes of interest to healthcare systems.
+
+# Start Fresh.
+```{r tabula-rasa, results = 'hide'}
+rm(list = ls())
+```
+
+# Setup
+```{r setup, results = 'hide'}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE)
+
+options(tibble.print_max = Inf, tibble.print_min = Inf)
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(tidyverse)
+library(lubridate)
+library(mgcv)
+library(segmented)
+library(gratia)
+library(splines)
+library(see)
+library(ggridges)
+library(extrafont)
+library(patchwork)
+library(gtsummary)
+```
+
+Note: after my initial pass at data cleaning, Dr. Natalie Jansen made additional edits and tidied it, so we are using that as the most recent clean team data.
+
+# Load and inspect health system Data.
+```{r import-data, results = 'hide'}
+d <-  read_csv("Dec2025Clean.csv")
+```
+
+# Some basic summary stats.
+```{r summary-stats, results = 'hide'}
+d %>% 
+  count(esi) %>%
+  mutate(prop = n / sum(n))
+
+d %>%
+  count(sex) %>%
+  mutate(prop = n / sum(n))
+```
+
+# Overall Dataset Temporal Data summary stats.
+```{r summary-timein, results = 'hide'}
+min(d$timein, na.rm = TRUE)
+max(d$timein, na.rm = TRUE)
+```
+
+# Age.
+```{r summary-age, results = 'hide'}
+d %>%
+  summarise(
+    mean_age   = mean(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    min_age    = min(age, na.rm = TRUE),
+    max_age    = max(age, na.rm = TRUE),
+    sd_age     = sd(age, na.rm = TRUE),
+    n_missing  = sum(is.na(age))
+  )
+```
+
+Per Greg's advice we opted to move forward with using Heat Index as our exposure variable, as opposed to Tmax or Tavg or something else. The Heat Index data came from Emma via Keith Spangler's work (as cited in the paper).
+
+# Import heat index data.
+```{r heat-index-data, results = 'hide'}
+hi <- readRDS("SuffolkMA_2000_2023_EXPORT.rds")
+```
+
+# Quality check on the date variables before merging.
+```{r date-quality, results = 'hide'}
+str(d$date)
+class(d$date)
+
+str(hi$Date)
+class(hi$Date)
+```
+
+# Subset of the heat index data for merging.
+```{r hi-subset, results = 'hide'}
+hi_subset <- hi %>%
+  dplyr::select(Date, HImax_C, HImean_C)
+
+d <- d %>%
+  dplyr::left_join(hi_subset, by = c("date" = "Date"))
+```
+
+# Convert deg C to deg F.
+```{r units, results = 'hide'}
+d <- d %>%
+  mutate(
+    HImax_F  = HImax_C  * 9/5 + 32,
+    HImean_F = HImean_C * 9/5 + 32
+  )
+```
+
+# Subsetting the dataset with the warm season over the years.
+```{r warmseason, results = 'hide'}
+d_warm <- d %>%
+  filter(
+    format(date, "%m-%d") >= "05-01",
+    format(date, "%m-%d") <= "09-30"
+  )
+```
+
+And that passes the vibe check: the original dataset was 1.15 million lines and the d_warm dataset is ~489k lines.
+
+# Sanity check of times.
+```{r sanity1, results = 'hide'}
+d_warm %>%
+  summarise(
+    across(
+      c(doortodoc, doctodecision, boarding, los),
+      list(
+        n      = ~ sum(!is.na(.)),
+        mean   = ~ mean(., na.rm = TRUE),
+        sd     = ~ sd(., na.rm = TRUE),
+        p25    = ~ quantile(., 0.25, na.rm = TRUE),
+        median = ~ median(., na.rm = TRUE),
+        p75    = ~ quantile(., 0.75, na.rm = TRUE),
+        min    = ~ min(., na.rm = TRUE),
+        max    = ~ max(., na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+```
+
+Some of the outliers are still in there...
+
+# Remove outliers.
+```{r bye-outliers, results = 'hide'}
+d_warm1 <- d_warm %>%
+  filter(
+    doortodoc_outlier      != 1,
+    doctodecision_outlier  != 1,
+    boarding_outlier       != 1,
+    los_outlier            != 1
+  )
+```
+
+```{r sanity2, results = 'hide'}
+d_warm1 %>%
+  summarise(
+    across(
+      c(doortodoc, doctodecision, boarding, los),
+      list(
+        n      = ~ sum(!is.na(.)),
+        mean   = ~ mean(., na.rm = TRUE),
+        sd     = ~ sd(., na.rm = TRUE),
+        p25    = ~ quantile(., 0.25, na.rm = TRUE),
+        median = ~ median(., na.rm = TRUE),
+        p75    = ~ quantile(., 0.75, na.rm = TRUE),
+        min    = ~ min(., na.rm = TRUE),
+        max    = ~ max(., na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+```
+
+# Removing negative time values.
+```{r goodbye-negative-energy, results = 'hide'}
+d_warm2 <- d_warm1 %>%
+  filter(
+    if_all(
+      c(doortodoc, doctodecision, boarding, los),
+      ~ is.na(.) | . >= 0
+    )
+  )
+```
+
+Now before we go further, we computed boarding times in earlier iterations of this dataset, but technically, boarding is only for people BOARDING waiting to go upstairs, ie, be admitted. So technically, the boarding times do not apply to the entire dataset, even though we "computed" them. I want to start by seeing what the different categories are for dispo and then we'll remove anything that wasn't a --> inpatient team.
+
+We eventually came back to this and instead of just using what was marked as "Admitted", Professor Dresser went through all of the variations that came up in the vibe check and manually coded as whether they were admitted eventually or not.
+
+# Dispo vibe check.
+```{r dispo-vibes, results = 'hide'}
+d_warm2 %>%
+  count(dispo) %>%
+  arrange(desc(n))
+
+dispo_summary <- d_warm2 %>%
+  count(dispo) %>%
+  arrange(desc(n))
+
+write.csv(dispo_summary, "dispo_summary.csv", row.names = FALSE)
+```
+
+177254 were admitted according to the basic approach, but for our updated approach the number should be higher. Alright, so now I want a variable for the admitted patients.
+
+# Importing Dresser Admit Codes
+
+```{r true-admits-improved, results = 'hide'}
+dispo_map <- read_csv("dispo_summary_ExcelCD.csv")
+```
+
+# And then merging with our main dataset.
+```{r admits, results = 'hide'}
+d_warm2 <- d_warm2 %>%
+  left_join(dispo_map, by = "dispo") %>%
+  mutate(
+    admitted = as.integer(AdmitEquivalent)
+  )
+```
+
+# Admitted.
+```{r admitted}
+d_warm2 %>% count(admitted)
+```
+
+180773. Nice.
+
+Ok, now, I want to REMOVE the values of Boarding times for any patient that was not admitted.
+
+# True boarding times only.
+```{r true-boarding, results = 'hide'}
+d_warm2$boarding[d_warm2$admitted == 0] <- NA
+
+d_warm2 %>%
+  group_by(admitted) %>%
+  summarise(
+    n = n(),
+    non_na_boarding = sum(!is.na(boarding))
+  )
+```
+
+# Confirm that adjusting time variables are factors.
+```{r factor-time, results = 'hide'}
+d_warm2 <- d_warm2 %>%
+  mutate(
+    dow   = factor(dow),
+    month = factor(month),
+    year  = factor(year)
+  )
+```
+
+# Plotting the dist of HImax_F across the data.
+```{r heat-index-max}
+# Final Revised Figure: Maximum Heat Index Distribution
+ggplot(d_warm2, aes(x = HImax_F)) +
+  # Main distribution in Navy hex #203463
+  geom_density(na.rm = TRUE, fill = "#203463", color = "#203463", alpha = 0.95) +
+  
+  # Saffron threshold lines at 90 and 95 (#FF9933)
+  geom_vline(xintercept = c(90, 95), linetype = "dashed", color = "#FF9933", size = 0.7) +
+  
+  # Anchoring the plot to the axes
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.05)),
+    breaks = c(40, 60, 80, 90, 95, 100),
+    labels = c("40", "60", "80", "90°F", "95°F", "100")
+  ) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  
+  labs(
+    title = "Distribution of Daily Maximum Heat Index Across Warm Seasons",
+    x = "Maximum Heat Index (°F)",
+    y = NULL 
+  ) +
+  
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Helvetica"),
+    
+    # gridlines as clean vertical 
+    panel.grid.major.x = element_line(color = "grey92"),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    
+    # axis formatting: removing y labels for clarity
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.x = element_line(color = "black"),
+    
+    # Highlighting 90 and 95 in saffron, leaving 100 in black
+    axis.text.x = element_text(
+        color = c("black", "black", "#FF9933", "#FF9933", "black"),
+        face = c("plain", "plain", "bold", "bold", "plain"),
+        size = 14
+    ),
+    
+    # title and axis labels
+    plot.title = element_text(face = "bold", size = 16, color = "black"), 
+    axis.title.x = element_text(size = 16, color = "black")
+  )
+
+ggsave(
+  filename = "Heat_Index_Distribution_NSB.png",
+  plot = last_plot(),
+  device = "png",
+  width = 7,        
+  height = 5,       
+  units = "in",
+  dpi = 600,        
+  bg = "white"      
+)
+```
+
+# Creating a combined multipanel figure of the dists
+```{r multipanel-distributions}
+# Function with increased font sizes and axis title buffering
+create_op_plot_high_res <- function(data, var, label, x_limit) {
+  
+  # calc total n before filtering
+  n_true <- sum(!is.na(data[[var]]))
+  
+  # calc median from full dataset before filtering
+  median_val <- median(data[[var]], na.rm = TRUE)
+  
+  # data filter to clean fig
+  plot_data <- data %>% 
+    filter(!is.na(.data[[var]]), .data[[var]] <= x_limit)
+  
+  ggplot(plot_data, aes_string(x = var)) +
+    geom_density(na.rm = TRUE, fill = "black", color = "black", alpha = 0.85) +
+    
+    # median labeling
+    annotate("text", 
+             x = x_limit * 0.75, 
+             y = Inf, 
+             label = paste0("Median: ", round(median_val, 0), " min"),
+             color = "black",
+             fontface = "bold", 
+             size = 8,
+             family = "Helvetica",
+             vjust = 3.5,
+             hjust = 0.5) +
+    
+    scale_x_continuous(limits = c(0, x_limit), expand = c(0, 0)) + 
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    
+    labs(
+      subtitle = paste0(label, " (Total n = ", format(n_true, big.mark=","), ")"),
+      x = "Time (minutes)",
+      y = NULL
+    ) +
+    
+    theme_minimal() +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      panel.grid.major.x = element_line(color = "grey92"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x = element_line(color = "black", size = 0.8),
+      axis.line.y = element_line(color = "black", size = 0.8),
+      plot.subtitle = element_text(face = "bold", size = 22, color = "black"),
+      axis.text.x   = element_text(size = 20, color = "black"),
+      axis.title.x  = element_text(
+        size = 20, 
+        color = "black", 
+        face = "bold", 
+        margin = margin(t = 15)
+      ),
+      plot.margin = margin(10, 40, 10, 20) 
+    )
+}
+
+# make panels fig
+p1 <- create_op_plot_high_res(d_warm2, "doortodoc", "Door-to-Doc", 300)
+p2 <- create_op_plot_high_res(d_warm2, "doctodecision", "Doc-to-Decision", 1000)
+p3 <- create_op_plot_high_res(d_warm2, "boarding", "Boarding Time", 1500)
+p4 <- create_op_plot_high_res(d_warm2, "los", "Total ED LOS", 2000)
+
+# 2x2 no title
+combined_op_final <- (p1 + p2) / (p3 + p4)
+
+# export
+ggsave("ED_Operational_Distributions_Final_NSB.png", 
+       combined_op_final, 
+       width = 14, 
+       height = 10, 
+       dpi = 600, 
+       bg = "white")
+```
+
+# heat index threshold of 90
+```{r heat-index-90-threshold}
+# HI ≥ 90°F based on MAX
+d_warm2 <- d_warm2 %>%
+  mutate(
+    hi90_max = if_else(HImax_F >= 90,
+                       "HImax ≥ 90°F",
+                       "HImax < 90°F")
+  )
+
+# door to doc
+d_warm2 %>%
+  group_by(hi90_max) %>%
+  summarise(
+    n   = sum(!is.na(doortodoc)),
+    mean_doortodoc = mean(doortodoc, na.rm = TRUE)
+  )
+
+# doc to decision
+d_warm2 %>%
+  group_by(hi90_max) %>%
+  summarise(
+    n   = sum(!is.na(doctodecision)),
+    mean_doctodecision = mean(doctodecision, na.rm = TRUE)
+  )
+
+# boarding
+d_warm2 %>%
+  group_by(hi90_max) %>%
+  summarise(
+    n   = sum(!is.na(boarding)),
+    mean_boarding = mean(boarding, na.rm = TRUE)
+  )
+
+# lod
+d_warm2 %>%
+  group_by(hi90_max) %>%
+  summarise(
+    n   = sum(!is.na(los)),
+    mean_los = mean(los, na.rm = TRUE)
+  )
+```
+
+# heat index threshold 95
+```{r heat-index-95-threshold}
+# HI ≥ 95°F based on MAX
+d_warm2 <- d_warm2 %>%
+  mutate(
+    hi95_max = if_else(HImax_F >= 95,
+                       "HImax ≥ 95°F",
+                       "HImax < 95°F")
+  )
+
+# door to doc
+d_warm2 %>%
+  group_by(hi95_max) %>%
+  summarise(
+    n   = sum(!is.na(doortodoc)),
+    mean_doortodoc = mean(doortodoc, na.rm = TRUE)
+  )
+
+# doc to decision
+d_warm2 %>%
+  group_by(hi95_max) %>%
+  summarise(
+    n   = sum(!is.na(doctodecision)),
+    mean_doctodecision = mean(doctodecision, na.rm = TRUE)
+  )
+
+# boarding
+d_warm2 %>%
+  group_by(hi95_max) %>%
+  summarise(
+    n   = sum(!is.na(boarding)),
+    mean_boarding = mean(boarding, na.rm = TRUE)
+  )
+
+# los
+d_warm2 %>%
+  group_by(hi95_max) %>%
+  summarise(
+    n   = sum(!is.na(los)),
+    mean_los = mean(los, na.rm = TRUE)
+  )
+```
+
+# HI 90 t test
+```{r HI90-t-test}
+t.test(doortodoc ~ hi90_max, data = d_warm2)
+t.test(doctodecision ~ hi90_max, data = d_warm2)
+t.test(boarding ~ hi90_max, data = d_warm2)
+t.test(los ~ hi90_max, data = d_warm2)
+```
+
+# HI 95 t test
+```{r HI95-t-test}
+t.test(doortodoc ~ hi95_max, data = d_warm2)
+t.test(doctodecision ~ hi95_max, data = d_warm2)
+t.test(boarding ~ hi95_max, data = d_warm2)
+t.test(los ~ hi95_max, data = d_warm2)
+```
+
+# binary data setup of hi 90 and 95
+```{r HI90-HI95-binary-adj}
+d_warm2 <- d_warm2 %>%
+  mutate(
+    hi90 = if_else(HImax_F >= 90, 1, 0),
+    hi95 = if_else(HImax_F >= 95, 1, 0)
+  )
+```
+
+We cannot have any zero values, or else we would exclude a large amount of data, so we added one-millionth of a minute to each value in the dataset to allow for analysis.
+
+# gamma setup
+```{r no-zeros}
+d_warm2 <- d_warm2 %>%
+  mutate(
+    doortodoc_min     = as.numeric(doortodoc,     units = "mins"),
+    doctodecision_min = as.numeric(doctodecision, units = "mins"),
+    boarding_min      = as.numeric(boarding,      units = "mins"),
+    los_min           = as.numeric(los,           units = "mins")
+  )
+
+eps <- 1e-8
+
+d_warm2 <- d_warm2 %>%
+  mutate(
+    doortodoc_g     = doortodoc_min     + eps,
+    doctodecision_g = doctodecision_min + eps,
+    boarding_g      = boarding_min      + eps,
+    los_g           = los_min           + eps
+  )
+```
+
+# Complete final models with all variables adjusted for, including age and sex.
+
+First, some summary stats.
+
+```{r age-stats-again}
+d_warm2 %>%
+  summarise(
+    n          = sum(!is.na(age)),
+    mean_age   = mean(age, na.rm = TRUE),
+    sd_age     = sd(age, na.rm = TRUE),
+    min_age    = min(age, na.rm = TRUE),
+    p25_age    = quantile(age, 0.25, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    p75_age    = quantile(age, 0.75, na.rm = TRUE),
+    max_age    = max(age, na.rm = TRUE)
+  )
+
+d_warm2 %>%
+  count(sex) %>%
+  mutate(prop = n / sum(n))
+```
+
+
+This first set of models uses HI as a continuous variable and adjusts for age and sex as well.
+
+```{r gamma-the-sequel}
+# Door2Doc Model 1 (adjusted for age and sex)
+m_dtd_gamma <- glm(
+  doortodoc_g ~ HImax_F + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_dtd_gamma)
+
+# Doc to Decision Model 1 (adjusted for age and sex)
+m_doctodecision_gamma <- glm(
+  doctodecision_g ~ HImax_F + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_doctodecision_gamma)
+
+# Boarding Model 1 (adjusted for age and sex)
+m_boarding_gamma <- glm(
+  boarding_g ~ HImax_F + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_boarding_gamma)
+
+# LOS Model 1 (adjusted for age and sex)
+m_los_gamma <- glm(
+  los_g ~ HImax_F + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_los_gamma)
+```
+
+And the coefficients and CIs again:
+
+```{r sequel-gamma-coeffs-cis}
+# Coefficients in the Gamma cont HI models
+beta_HI_doortodoc     <- coef(m_dtd_gamma)["HImax_F"]
+exp(beta_HI_doortodoc)
+
+beta_HI_doctodecision <- coef(m_doctodecision_gamma)["HImax_F"]
+exp(beta_HI_doctodecision)
+
+beta_HI_boarding      <- coef(m_boarding_gamma)["HImax_F"]
+exp(beta_HI_boarding)
+
+beta_HI_los           <- coef(m_los_gamma)["HImax_F"]
+exp(beta_HI_los)
+
+# Confidence Intervals in the Gamma cont HI models
+ci_doortodoc     <- confint.default(m_dtd_gamma, "HImax_F")
+exp(ci_doortodoc)
+
+ci_doctodecision <- confint.default(m_doctodecision_gamma, "HImax_F")
+exp(ci_doctodecision)
+
+ci_boarding      <- confint.default(m_boarding_gamma, "HImax_F")
+exp(ci_boarding)
+
+ci_los           <- confint.default(m_los_gamma, "HImax_F")
+exp(ci_los)
+```
+
+# Heat Index Gamma 90 threshold binary with age and sex
+
+```{r hig90tbwag}
+# Underlying distribution is Gamma, heat index is binary at 90°F
+# Door-to-doc
+m_dtd_gamma_hi90 <- glm(
+  doortodoc_g ~ hi90 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_dtd_gamma_hi90)
+
+# Doc-to-decision
+m_doctodecision_gamma_hi90 <- glm(
+  doctodecision_g ~ hi90 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_doctodecision_gamma_hi90)
+
+# Boarding
+m_boarding_gamma_hi90 <- glm(
+  boarding_g ~ hi90 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_boarding_gamma_hi90)
+
+# LOS
+m_los_gamma_hi90 <- glm(
+  los_g ~ hi90 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_los_gamma_hi90)
+```
+
+# Coefficients and CIs
+
+```{r coeffs-cis-gtb90hiag}
+beta_hi90_doortodoc     <- coef(m_dtd_gamma_hi90)["hi90"]
+exp(beta_hi90_doortodoc)
+
+beta_hi90_doctodecision <- coef(m_doctodecision_gamma_hi90)["hi90"]
+exp(beta_hi90_doctodecision)
+
+beta_hi90_boarding      <- coef(m_boarding_gamma_hi90)["hi90"]
+exp(beta_hi90_boarding)
+
+beta_hi90_los           <- coef(m_los_gamma_hi90)["hi90"]
+exp(beta_hi90_los)
+
+ci_hi90_doortodoc     <- confint.default(m_dtd_gamma_hi90, "hi90")
+exp(ci_hi90_doortodoc)
+
+ci_hi90_doctodecision <- confint.default(m_doctodecision_gamma_hi90, "hi90")
+exp(ci_hi90_doctodecision)
+
+ci_hi90_boarding      <- confint.default(m_boarding_gamma_hi90, "hi90")
+exp(ci_hi90_boarding)
+
+ci_hi90_los           <- confint.default(m_los_gamma_hi90, "hi90")
+exp(ci_hi90_los)
+```
+
+# And the sequel sequel for 95 binary HI threshold
+
+```{r hit95gwag}
+# Heat Index Gamma 95 threshold binary with age and sex
+
+# Door-to-doc
+m_dtd_gamma_hi95 <- glm(
+  doortodoc_g ~ hi95 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_dtd_gamma_hi95)
+
+# Doc-to-decision
+m_doctodecision_gamma_hi95 <- glm(
+  doctodecision_g ~ hi95 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_doctodecision_gamma_hi95)
+
+# Boarding
+m_boarding_gamma_hi95 <- glm(
+  boarding_g ~ hi95 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_boarding_gamma_hi95)
+
+# LOS
+m_los_gamma_hi95 <- glm(
+  los_g ~ hi95 + age + sex + dow + month * year,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+
+summary(m_los_gamma_hi95)
+```
+
+And the coefficients and cis...
+
+```{r the-coefficients-cis-again}
+# Coefficients and CIs for HI ≥ 95°F
+
+beta_hi95_doortodoc     <- coef(m_dtd_gamma_hi95)["hi95"]
+exp(beta_hi95_doortodoc)
+
+beta_hi95_doctodecision <- coef(m_doctodecision_gamma_hi95)["hi95"]
+exp(beta_hi95_doctodecision)
+
+beta_hi95_boarding      <- coef(m_boarding_gamma_hi95)["hi95"]
+exp(beta_hi95_boarding)
+
+beta_hi95_los           <- coef(m_los_gamma_hi95)["hi95"]
+exp(beta_hi95_los)
+
+ci_hi95_doortodoc     <- confint.default(m_dtd_gamma_hi95, "hi95")
+exp(ci_hi95_doortodoc)
+
+ci_hi95_doctodecision <- confint.default(m_doctodecision_gamma_hi95, "hi95")
+exp(ci_hi95_doctodecision)
+
+ci_hi95_boarding      <- confint.default(m_boarding_gamma_hi95, "hi95")
+exp(ci_hi95_boarding)
+
+ci_hi95_los           <- confint.default(m_los_gamma_hi95, "hi95")
+exp(ci_hi95_los)
+```
+
+As a part of the secondary analyeses, we also looked to see if there was a significant difference in the number of patients who Left Without Being Seen (LWBS) and left Against Medical Advice (AMA) on hot days as compared to not
+
+```{r lwbsama}
+#LWBS and AMA
+
+d_warm2 <- d_warm2 %>%
+  mutate(
+    hi90 = if_else(HImax_F >= 90, 1, 0),
+    hi95 = if_else(HImax_F >= 95, 1, 0)
+  )
+
+table(d_warm2$dispo)
+
+lwbs_categories <- c(
+  "LEFT WITHOUT BEING SEEN",
+  "O - LEFT WITHOUT BE",
+  "O - LEFT WITHOUT BEING SEE",
+  "O - LWBS",
+  "O - PT LEFT FROM WAITING RM",
+  "O - PT LEFT  WITOUT BEING SEEN YS",
+  "O - PT LWBS TL",
+  "O - PT LEFT BEFORE TRIAGE WAS FINISHED",
+  "O - PT LEFT BEFORE TRIAGE WAS FINISHED"
+)
+
+ama_categories <- c(
+  "O - AGAINST MED",
+  "O - AGAINST MEDCIAL ADVICE",
+  "O - AGAINST MEDI",
+  "O - AGAINST MEDICAL",
+  "O - AGAINST MEDICAL ADIVCE",
+  "O - AGAINST MEDICAL ADVIC",
+  "O - AGAINST MEDICAL ADVISE",
+  "O - AMA",
+  "O - AMA'",
+  "O - AMA\\",
+  "O - ELOPED",
+  "O - LEFT AGAINST MEDICAL ADVICE",
+  "O - LEFT AGAINST MEDICAL ADVISE",
+  "O - LEFT AGAINST MEDICAL LEAVE",
+  "O - LEFT AGAINST MEDICAL RECORD",
+  "O - LEFT AMA",
+  "O - LEFT AMA",
+  "O - PATIENT LEFT AMA",
+  "O - PT LEFT  AGAINST MEDICAL ADVICE",
+  "O - PT LEFT AGAINST  MEDICAL ADVICE",
+  "O - PT LEFT AGAINST MED ADVICE",
+  "O - PT LEFT AGAINST MEDICAL ADVICE",
+  "O - PT LEFT AGAINST MEDICAL ADVICED",
+  "O - PT LEFT AGAINST MEDICAL ADVISE",
+  "O - PT LEFT AMA",
+  "O - PT LEFT AMA",
+  "O - PT LET AGAINST MEDICAL ADVICE",
+  "O - PT. SIGNED/LEFT AGAINST MED. ADVICE",
+  "O - PT. LEFT AMA"
+)
+
+d_warm2 <- d_warm2 %>%
+  mutate(
+    lwbs = ifelse(dispo %in% lwbs_categories, 1, 0),
+    ama  = ifelse(dispo %in% ama_categories, 1, 0)
+  )
+
+# Quick check
+table(d_warm2$lwbs)
+table(d_warm2$ama)
+
+# LWBS - Binary models only
+m_lwbs_hi90 <- glm(lwbs ~ hi90 + age + sex + 
+                   dow + month + as.factor(year),
+                   data = d_warm2,
+                   family = binomial(link = "logit"))
+
+m_lwbs_hi95 <- glm(lwbs ~ hi95 + age + sex + 
+                   dow + month + as.factor(year),
+                   data = d_warm2,
+                   family = binomial(link = "logit"))
+
+# AMA - Binary models only
+m_ama_hi90 <- glm(ama ~ hi90 + age + sex + 
+                  dow + month + as.factor(year),
+                  data = d_warm2,
+                  family = binomial(link = "logit"))
+
+m_ama_hi95 <- glm(ama ~ hi95 + age + sex + 
+                  dow + month + as.factor(year),
+                  data = d_warm2,
+                  family = binomial(link = "logit"))
+
+# Extract ORs and CIs
+exp(coef(m_lwbs_hi90)["hi90"])
+exp(confint.default(m_lwbs_hi90, "hi90"))
+
+exp(coef(m_lwbs_hi95)["hi95"])
+exp(confint.default(m_lwbs_hi95, "hi95"))
+
+exp(coef(m_ama_hi90)["hi90"])
+exp(confint.default(m_ama_hi90, "hi90"))
+
+exp(coef(m_ama_hi95)["hi95"])
+exp(confint.default(m_ama_hi95, "hi95"))
+```
+
+# Creating Table 1 for the paper
+
+```{r table-1-gen}
+# Create combined emergency transport variable (ambulance + heli)
+d_warm2 <- d_warm2 %>%
+  mutate(
+    ems_arrival = if_else(str_starts(motreg, "AM") | str_starts(motreg, "HL"), 1, 0)
+  )
+
+d_warm2 %>%
+  count(ems_arrival) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+# Create binary Medicare variable
+d_warm2 <- d_warm2 %>%
+  mutate(
+    medicare = if_else(str_detect(primins, regex("medicare", ignore_case = TRUE)), 1, 0)
+  )
+
+# Quick check
+d_warm2 %>%
+  count(medicare) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+# See all unique ESI values and counts
+d_warm2 %>%
+  count(esi) %>%
+  arrange(esi) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+d_warm2 <- d_warm2 %>%
+  mutate(
+    race_collapsed = case_when(
+      str_detect(race, regex("^WHITE", ignore_case = TRUE)) ~ "White",
+      str_detect(race, regex("^BLACK", ignore_case = TRUE)) ~ "Black/African American",
+      str_detect(race, regex("^HISPANIC", ignore_case = TRUE)) ~ "Hispanic/Latino",
+      str_detect(race, regex("^ASIAN", ignore_case = TRUE)) ~ "Asian",
+      TRUE ~ "Other/Unknown"
+    )
+  )
+
+d_warm2 %>%
+  count(race_collapsed) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(desc(n))
+
+# age categories
+d_warm2 <- d_warm2 %>%
+  mutate(
+    age_cat = case_when(
+      age < 18           ~ "<18",
+      age >= 18 & age < 45 ~ "18-44",
+      age >= 45 & age < 65 ~ "45-64",
+      age >= 65 & age < 75 ~ "65-74",
+      age >= 75          ~ "≥75",
+      TRUE               ~ NA_character_
+    ),
+    age_cat = factor(age_cat, levels = c("<18", "18-44", "45-64", "65-74", "≥75"))
+  )
+
+# check
+d_warm2 %>%
+  count(age_cat) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+# check
+d_warm2 %>%
+  count(sex) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+# check
+d_warm2 %>%
+  count(dow) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(dow)
+
+table1_csv <- d_warm2 %>%
+  summarise(
+    # age categories
+    n_age_under18 = sum(age_cat == "<18", na.rm = TRUE),
+    pct_age_under18 = round(n_age_under18 / n() * 100, 1),
+    
+    n_age_18_44 = sum(age_cat == "18-44", na.rm = TRUE),
+    pct_age_18_44 = round(n_age_18_44 / n() * 100, 1),
+    
+    n_age_45_64 = sum(age_cat == "45-64", na.rm = TRUE),
+    pct_age_45_64 = round(n_age_45_64 / n() * 100, 1),
+    
+    n_age_65_74 = sum(age_cat == "65-74", na.rm = TRUE),
+    pct_age_65_74 = round(n_age_65_74 / n() * 100, 1),
+    
+    n_age_75plus = sum(age_cat == "≥75", na.rm = TRUE),
+    pct_age_75plus = round(n_age_75plus / n() * 100, 1),
+    
+    # sex
+    n_female = sum(sex == "F", na.rm = TRUE),
+    pct_female = round(n_female / n() * 100, 1),
+    
+    n_male = sum(sex == "M", na.rm = TRUE),
+    pct_male = round(n_male / n() * 100, 1),
+    
+    # race
+    n_white = sum(race_collapsed == "White", na.rm = TRUE),
+    pct_white = round(n_white / n() * 100, 1),
+    
+    n_black = sum(race_collapsed == "Black/African American", na.rm = TRUE),
+    pct_black = round(n_black / n() * 100, 1),
+    
+    n_hispanic = sum(race_collapsed == "Hispanic/Latino", na.rm = TRUE),
+    pct_hispanic = round(n_hispanic / n() * 100, 1),
+    
+    n_asian = sum(race_collapsed == "Asian", na.rm = TRUE),
+    pct_asian = round(n_asian / n() * 100, 1),
+    
+    n_other = sum(race_collapsed == "Other/Unknown", na.rm = TRUE),
+    pct_other = round(n_other / n() * 100, 1),
+    
+    # ESI
+    n_esi1 = sum(esi == 1, na.rm = TRUE),
+    pct_esi1 = round(n_esi1 / n() * 100, 1),
+    
+    n_esi2 = sum(esi == 2, na.rm = TRUE),
+    pct_esi2 = round(n_esi2 / n() * 100, 1),
+    
+    n_esi3 = sum(esi == 3, na.rm = TRUE),
+    pct_esi3 = round(n_esi3 / n() * 100, 1),
+    
+    n_esi4 = sum(esi == 4, na.rm = TRUE),
+    pct_esi4 = round(n_esi4 / n() * 100, 1),
+    
+    n_esi5 = sum(esi == 5, na.rm = TRUE),
+    pct_esi5 = round(n_esi5 / n() * 100, 1),
+    
+    # EMS arrival
+    n_ems = sum(ems_arrival == 1, na.rm = TRUE),
+    pct_ems = round(n_ems / n() * 100, 1),
+    
+    # medicare
+    n_medicare = sum(medicare == 1, na.rm = TRUE),
+    pct_medicare = round(n_medicare / n() * 100, 1),
+    
+    # adm
+    n_admitted = sum(admitted == "Yes", na.rm = TRUE),
+    pct_admitted = round(n_admitted / n() * 100, 1)
+  )
+
+write_csv(table1_csv, "table1_patient_characteristics.csv")
+print(table1_csv)
+```
+
+
+# secondary analysis of door to doc
+
+```{r posthoc-ergo-propterhoc}
+# daily visit volume variable
+daily_volume <- d_warm2 %>%
+  group_by(date) %>%
+  summarise(daily_visits = n())
+
+# prior day volume
+daily_volume <- daily_volume %>%
+  arrange(date) %>%
+  mutate(prior_day_visits = lag(daily_visits))
+
+# Merge back into main dataset
+d_warm2 <- d_warm2 %>%
+  left_join(daily_volume, by = "date")
+
+# ESI is ordinal
+d_warm2 <- d_warm2 %>%
+  mutate(esi = factor(esi))
+
+# doortodoc Model A including ESI
+m_dtd_gamma_esi <- glm(
+  doortodoc_g ~ HImax_F + age + sex + dow + month * year + esi,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+summary(m_dtd_gamma_esi)
+exp(coef(m_dtd_gamma_esi)["HImax_F"])
+exp(confint.default(m_dtd_gamma_esi, "HImax_F"))
+
+# doortodoc Model B including daily visit volume
+m_dtd_gamma_vol <- glm(
+  doortodoc_g ~ HImax_F + age + sex + dow + month * year + daily_visits,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+summary(m_dtd_gamma_vol)
+exp(coef(m_dtd_gamma_vol)["HImax_F"])
+exp(confint.default(m_dtd_gamma_vol, "HImax_F"))
+
+# doortodoc Model C incuding prior day visit volume
+m_dtd_gamma_priorvol <- glm(
+  doortodoc_g ~ HImax_F + age + sex + dow + month * year + prior_day_visits,
+  data   = d_warm2,
+  family = Gamma(link = "log")
+)
+summary(m_dtd_gamma_priorvol)
+exp(coef(m_dtd_gamma_priorvol)["HImax_F"])
+exp(confint.default(m_dtd_gamma_priorvol, "HImax_F"))
+```
+
+# and does the number of EMS arrivals change on hot days versus not?
+
+```{r ems-heat-do-it}
+
+# EMS arrival - Binary models only
+m_ems_hi90 <- glm(ems_arrival ~ hi90 + age + sex + 
+                  dow + month + as.factor(year),
+                  data = d_warm2,
+                  family = binomial(link = "logit"))
+
+m_ems_hi95 <- glm(ems_arrival ~ hi95 + age + sex + 
+                  dow + month + as.factor(year),
+                  data = d_warm2,
+                  family = binomial(link = "logit"))
+
+# Extract ORs and CIs
+exp(coef(m_ems_hi90)["hi90"])
+exp(confint.default(m_ems_hi90, "hi90"))
+
+exp(coef(m_ems_hi95)["hi95"])
+exp(confint.default(m_ems_hi95, "hi95"))
+```
+
+
+# To ensure we have the summary stats for our T1
+
+```{r summary-stats-binary-his}
+library(dplyr)
+library(tidyr)
+
+# Set 1: Summary Stats by the 90°F Threshold
+stats_hi90 <- d_warm2 %>%
+  group_by(hi90_max) %>%
+  summarise(
+    n = n(),
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    # Calculating % Female (assuming sex is coded/labeled)
+    n_female = sum(sex == "Female" | sex == "F", na.rm = TRUE),
+    pct_female = (n_female / n) * 100
+  )
+
+# Set 2: Summary Stats by the 95°F Threshold
+stats_hi95 <- d_warm2 %>%
+  group_by(hi95_max) %>%
+  summarise(
+    n = n(),
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    n_female = sum(sex == "Female" | sex == "F", na.rm = TRUE),
+    pct_female = (n_female / n) * 100
+  )
+
+# rslts print
+print("--- 90°F Threshold Stats ---")
+print(stats_hi90)
+print("--- 95°F Threshold Stats ---")
+print(stats_hi95)
+```
+
+Other content for T1 or Supplementary Table
+
+```{r supplement}
+library(dplyr)
+library(tidyr)
+
+# --- TABLE 1: The Annual Summaries ---
+table1_byyear <- d_warm2 %>%
+  group_by(year) %>%
+  summarise(
+    total_visits = n(),
+    
+    # days above thresholds (unique days)
+    days_hi90 = n_distinct(date[HImax_F >= 90]),
+    days_hi95 = n_distinct(date[HImax_F >= 95]),
+    
+    # visits above thresholds
+    visits_hi90 = sum(HImax_F >= 90, na.rm = TRUE),
+    visits_hi95 = sum(HImax_F >= 95, na.rm = TRUE),
+    
+    # los
+    mean_los = round(mean(los, na.rm = TRUE), 1),
+    median_los = round(median(los, na.rm = TRUE), 1),
+    
+    # door to doc
+    mean_doortodoc = round(mean(doortodoc, na.rm = TRUE), 1),
+    median_doortodoc = round(median(doortodoc, na.rm = TRUE), 1),
+    
+    # doc to decision
+    mean_doctodecision = round(mean(doctodecision, na.rm = TRUE), 1),
+    median_doctodecision = round(median(doctodecision, na.rm = TRUE), 1),
+    
+    # boarding
+    mean_boarding = round(mean(boarding, na.rm = TRUE), 1),
+    median_boarding = round(median(boarding, na.rm = TRUE), 1)
+  )
+
+# sums at bottom of table
+table1_totals <- d_warm2 %>%
+  summarise(
+    year = "Overall",
+    total_visits = n(),
+    days_hi90 = n_distinct(date[HImax_F >= 90]),
+    days_hi95 = n_distinct(date[HImax_F >= 95]),
+    visits_hi90 = sum(HImax_F >= 90, na.rm = TRUE),
+    visits_hi95 = sum(HImax_F >= 95, na.rm = TRUE),
+    mean_los = round(mean(los, na.rm = TRUE), 1),
+    median_los = round(median(los, na.rm = TRUE), 1),
+    mean_doortodoc = round(mean(doortodoc, na.rm = TRUE), 1),
+    median_doortodoc = round(median(doortodoc, na.rm = TRUE), 1),
+    mean_doctodecision = round(mean(doctodecision, na.rm = TRUE), 1),
+    median_doctodecision = round(median(doctodecision, na.rm = TRUE), 1),
+    mean_boarding = round(mean(boarding, na.rm = TRUE), 1),
+    median_boarding = round(median(boarding, na.rm = TRUE), 1)
+  )
+
+table1_final <- bind_rows(table1_byyear, table1_totals)
+print(table1_final)
+
+# --- TABLE 2: By Heat Threshold ---
+
+# 90F threshold
+table2_hi90 <- d_warm2 %>%
+  mutate(heat_group = ifelse(HImax_F >= 90, 
+                             "HImax >= 90F", 
+                             "HImax < 90F")) %>%
+  group_by(heat_group) %>%
+  summarise(
+    n_visits = n(),
+    mean_los = round(mean(los, na.rm = TRUE), 1),
+    median_los = round(median(los, na.rm = TRUE), 1),
+    mean_doortodoc = round(mean(doortodoc, na.rm = TRUE), 1),
+    median_doortodoc = round(median(doortodoc, na.rm = TRUE), 1),
+    mean_doctodecision = round(mean(doctodecision, na.rm = TRUE), 1),
+    median_doctodecision = round(median(doctodecision, na.rm = TRUE), 1),
+    mean_boarding = round(mean(boarding, na.rm = TRUE), 1),
+    median_boarding = round(median(boarding, na.rm = TRUE), 1)
+  )
+
+# 95F threshold
+table2_hi95 <- d_warm2 %>%
+  mutate(heat_group = ifelse(HImax_F >= 95, 
+                             "HImax >= 95F", 
+                             "HImax < 95F")) %>%
+  group_by(heat_group) %>%
+  summarise(
+    n_visits = n(),
+    mean_los = round(mean(los, na.rm = TRUE), 1),
+    median_los = round(median(los, na.rm = TRUE), 1),
+    mean_doortodoc = round(mean(doortodoc, na.rm = TRUE), 1),
+    median_doortodoc = round(median(doortodoc, na.rm = TRUE), 1),
+    mean_doctodecision = round(mean(doctodecision, na.rm = TRUE), 1),
+    median_doctodecision = round(median(doctodecision, na.rm = TRUE), 1),
+    mean_boarding = round(mean(boarding, na.rm = TRUE), 1),
+    median_boarding = round(median(boarding, na.rm = TRUE), 1)
+  )
+
+print(table2_hi90)
+print(table2_hi95)
+
+# save
+write.csv(table1_final, "table1_by_year.csv", row.names = FALSE)
+write.csv(table2_hi90, "table2_by_hi90.csv", row.names = FALSE)
+write.csv(table2_hi95, "table2_by_hi95.csv", row.names = FALSE)
+```
+
+
+# Shall we make some figures
+# Creating the split Violin Plots
+
+#90F Heat Index Final Figure Split Violin
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --- 1. THE REFINED MAIN FUNCTION FOR 90 FIG ---
+create_op_panel_final <- function(data, var_name, display_label, y_limit) {
+  
+  # A. calc TRUE means from the full dataset
+  mean_hot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi90 == 1) %>% 
+    dplyr::summarise(m = mean(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+    
+  mean_nothot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi90 == 0) %>% 
+    dplyr::summarise(m = mean(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+
+  # B. clipped data
+  plot_df <- data %>%
+    dplyr::filter(!is.na(.data[[var_name]]), .data[[var_name]] <= y_limit) %>%
+    mutate(dummy_x = display_label)
+
+  # C. plot
+  ggplot(plot_df, aes_string(x = "dummy_x", y = var_name, fill = "hi90_max")) +
+    geom_split_violin(alpha = 0.9, color = "black", size = 0.5) +
+    
+    # min labels annotation
+    annotate("text", x = 0.78, y = y_limit * 0.55, 
+             label = paste0(round(mean_nothot, 0), " min"), 
+             color = "#203463", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    annotate("text", x = 1.22, y = y_limit * 0.55, 
+             label = paste0(round(mean_hot, 0), " min"), 
+             color = "#FF9933", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    # titles
+    scale_fill_manual(values = c("HImax < 90°F" = "#203463", "HImax ≥ 90°F" = "#FF9933"), name = NULL) +
+    scale_y_continuous(limits = c(0, y_limit), expand = c(0, 0)) +
+    
+    labs(y = "Minutes", x = NULL) +
+    theme_minimal() +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.y = element_text(size = 18), 
+      axis.title.y = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 24, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major.x = element_blank(),
+      axis.line.y = element_line(color = "black", size = 1.0)
+    )
+}
+
+# --- 2. MAKE PANELS ---
+p1 <- create_op_panel_final(d_warm2, "doortodoc", "Door-to-Doc", 300)
+p2 <- create_op_panel_final(d_warm2, "doctodecision", "Doc-to-Decision", 1000)
+p3 <- create_op_panel_final(d_warm2, "boarding", "Boarding Time", 1500)
+p4 <- create_op_panel_final(d_warm2, "los", "Total ED LOS", 2500)
+
+# --- 3. COMBINE AND THE LEGEND ---
+figure_3_ultra_vis <- (p1 + p2) / (p3 + p4) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 26), 
+    legend.key.size = unit(3, "lines"),
+    legend.margin = margin(t = 20)
+  )
+
+# save
+ggsave("Figure3_Final_Rounded_Minimalist_NSB.png", figure_3_ultra_vis, width = 14, height = 18, dpi = 600, bg = "white")
+
+#95F Heat Index Final Figure Split Violin
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --- 1. THE REFINED MAIN FUNCTION FOR 90 FIG ---
+create_op_panel_95F <- function(data, var_name, display_label, y_limit) {
+  
+  # A. calc TRUE means from the full dataset (but now using hi95)
+  mean_hot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi95 == 1) %>% 
+    dplyr::summarise(m = mean(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+    
+  mean_nothot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi95 == 0) %>% 
+    dplyr::summarise(m = mean(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+
+  # B. data for the visual
+  plot_df <- data %>%
+    dplyr::filter(!is.na(.data[[var_name]]), .data[[var_name]] <= y_limit) %>%
+    mutate(dummy_x = display_label)
+
+  # C. plot
+  ggplot(plot_df, aes_string(x = "dummy_x", y = var_name, fill = "hi95_max")) +
+    geom_split_violin(alpha = 0.9, color = "black", size = 0.5) +
+    
+    # minute annotations
+    annotate("text", x = 0.78, y = y_limit * 0.55, 
+             label = paste0(round(mean_nothot, 0), " min"), 
+             color = "#203463", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    annotate("text", x = 1.22, y = y_limit * 0.55, 
+             label = paste0(round(mean_hot, 0), " min"), 
+             color = "#FF9933", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    # scaling and shading
+    scale_fill_manual(values = c("HImax < 95°F" = "#203463", "HImax ≥ 95°F" = "#FF9933"), name = NULL) +
+    scale_y_continuous(limits = c(0, y_limit), expand = c(0, 0)) +
+    
+    labs(y = "Minutes", x = NULL) +
+    theme_minimal() +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.y = element_text(size = 18), 
+      axis.title.y = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 24, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major.x = element_blank(),
+      axis.line.y = element_line(color = "black", size = 1.0)
+    )
+}
+
+# --- 2. MAKE PANELS FOR THE 95F THRESHOLD ---
+p1_95 <- create_op_panel_95F(d_warm2, "doortodoc", "Door-to-Doc", 300)
+p2_95 <- create_op_panel_95F(d_warm2, "doctodecision", "Doc-to-Decision", 1000)
+p3_95 <- create_op_panel_95F(d_warm2, "boarding", "Boarding Time", 1500)
+p4_95 <- create_op_panel_95F(d_warm2, "los", "Total ED LOS", 2500)
+
+# --- 3. COMBINE AND ALSO THE LEGEND ---
+figure_95_final <- (p1_95 + p2_95) / (p3_95 + p4_95) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 26), 
+    legend.key.size = unit(3, "lines"),
+    legend.margin = margin(t = 20)
+  )
+
+# save
+ggsave("Figure4_95F_Threshold_Composite_NSB.png", figure_95_final, width = 14, height = 18, dpi = 600, bg = "white")
+
+
+# REFINED SPLIT VIOLIN PLOTS FOR 90F WITH MEDIANS
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --- 0. RECODE hi90_max WITH CLEAN UNICODE ---
+d_warm2 <- d_warm2 %>%
+  mutate(hi90_max = ifelse(hi90 == 0, "HImax < 90\u00b0F", "HImax \u2265 90\u00b0F"))
+
+# --- 1. THE REFINED MAIN FUNCTION ---
+create_op_panel_final <- function(data, var_name, display_label, y_limit) {
+  
+  # A. calc TRUE MEDIANS from the full dataset
+  median_hot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi90 == 1) %>% 
+    dplyr::summarise(m = median(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+    
+  median_nothot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi90 == 0) %>% 
+    dplyr::summarise(m = median(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+
+  # B. data
+  plot_df <- data %>%
+    dplyr::filter(!is.na(.data[[var_name]]), .data[[var_name]] <= y_limit) %>%
+    mutate(dummy_x = display_label)
+
+  # C. plot
+  ggplot(plot_df, aes_string(x = "dummy_x", y = var_name, fill = "hi90_max")) +
+    geom_split_violin(alpha = 0.9, color = "black", size = 0.5) +
+    
+    # annotate min labels
+    annotate("text", x = 0.78, y = y_limit * 0.55, 
+             label = paste0(round(median_nothot, 0), " min"), 
+             color = "#203463", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    annotate("text", x = 1.22, y = y_limit * 0.55, 
+             label = paste0(round(median_hot, 0), " min"), 
+             color = "#FF9933", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    scale_fill_manual(
+      values = c("HImax < 90\u00b0F" = "#203463", "HImax \u2265 90\u00b0F" = "#FF9933"), 
+      name = NULL
+    ) +
+    scale_y_continuous(limits = c(0, y_limit), expand = c(0, 0)) +
+    
+    labs(y = "Minutes", x = NULL) +
+    theme_minimal() +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.y = element_text(size = 18), 
+      axis.title.y = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 24, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major.x = element_blank(),
+      axis.line.y = element_line(color = "black", size = 1.0)
+    )
+}
+
+# --- 2. MAKE PANELS ---
+p1 <- create_op_panel_final(d_warm2, "doortodoc", "Door-to-Doc", 300)
+p2 <- create_op_panel_final(d_warm2, "doctodecision", "Doc-to-Decision", 1000)
+p3 <- create_op_panel_final(d_warm2, "boarding", "Boarding Time", 1500)
+p4 <- create_op_panel_final(d_warm2, "los", "Total ED LOS", 2500)
+
+# --- 3. COMBINE AND THEN THE LEGEND ---
+figure_3_ultra_vis <- (p1 + p2) / (p3 + p4) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 26), 
+    legend.key.size = unit(3, "lines"),
+    legend.margin = margin(t = 20)
+  )
+
+# save
+ggsave("Figure3_Final_Rounded_Minimalist_NSB.png", figure_3_ultra_vis, width = 14, height = 18, dpi = 600, bg = "white")
+
+# REFINED SPLIT VIOLIN PLOTS FOR 95 WITH MEDIANS
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --- 0. RECODE hi95_max WITH CLEAN UNICODE ---
+d_warm2 <- d_warm2 %>%
+  mutate(hi95_max = ifelse(hi95 == 0, "HImax < 95\u00b0F", "HImax \u2265 95\u00b0F"))
+
+# --- 1. THE REFINED 95 FUNCTION ---
+create_op_panel_95 <- function(data, var_name, display_label, y_limit) {
+  
+  # A. calc MEDIANS from total data
+  median_hot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi95 == 1) %>% 
+    dplyr::summarise(m = median(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+    
+  median_nothot <- data %>% 
+    dplyr::filter(!is.na(.data[[var_name]]), hi95 == 0) %>% 
+    dplyr::summarise(m = median(.data[[var_name]], na.rm = TRUE)) %>% 
+    dplyr::pull(m)
+
+  # B. data
+  plot_df <- data %>%
+    dplyr::filter(!is.na(.data[[var_name]]), .data[[var_name]] <= y_limit) %>%
+    mutate(dummy_x = display_label)
+
+  # C. plot
+  ggplot(plot_df, aes_string(x = "dummy_x", y = var_name, fill = "hi95_max")) +
+    geom_split_violin(alpha = 0.9, color = "black", size = 0.5) +
+    
+    # annotate mins labels
+    annotate("text", x = 0.78, y = y_limit * 0.55, 
+             label = paste0(round(median_nothot, 0), " min"), 
+             color = "#203463", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    annotate("text", x = 1.22, y = y_limit * 0.55, 
+             label = paste0(round(median_hot, 0), " min"), 
+             color = "#FF9933", fontface = "bold", size = 8.25, family = "Helvetica") +
+    
+    scale_fill_manual(
+      values = c("HImax < 95\u00b0F" = "#203463", "HImax \u2265 95\u00b0F" = "#FF9933"), 
+      name = NULL
+    ) +
+    scale_y_continuous(limits = c(0, y_limit), expand = c(0, 0)) +
+    
+    labs(y = "Minutes", x = NULL) +
+    theme_minimal() +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.y = element_text(size = 18), 
+      axis.title.y = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 24, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major.x = element_blank(),
+      axis.line.y = element_line(color = "black", size = 1.0)
+    )
+}
+
+# --- 2. MAKE PANELS ---
+p1 <- create_op_panel_95(d_warm2, "doortodoc", "Door-to-Doc", 300)
+p2 <- create_op_panel_95(d_warm2, "doctodecision", "Doc-to-Decision", 1000)
+p3 <- create_op_panel_95(d_warm2, "boarding", "Boarding Time", 1500)
+p4 <- create_op_panel_95(d_warm2, "los", "Total ED LOS", 2500)
+
+# --- 3. COMBINE AND ADD IN THE LEGEND ---
+figure_3_95_ultra_vis <- (p1 + p2) / (p3 + p4) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 26), 
+    legend.key.size = unit(3, "lines"),
+    legend.margin = margin(t = 20)
+  )
+
+# save
+ggsave("Figure3_95F_Rounded_Minimalist_NSB.png", figure_3_95_ultra_vis, width = 14, height = 18, dpi = 600, bg = "white")
+
 
