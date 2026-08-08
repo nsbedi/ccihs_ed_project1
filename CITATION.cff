@@ -10,6 +10,6 @@ authors:
   given-names: "QUINN"
 title: "Heat and Emergency Department Operations"
 version: 1.0.0
-doi: 
+doi: https://doi.org/10.5281/zenodo.21852052
 date-released: 2026-08-08
 url: "https://github.com/nsbedi/ccihs_ed_project1"
